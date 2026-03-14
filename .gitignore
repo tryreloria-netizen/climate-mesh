@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/climate_mesh.db
+data/climate_mesh.db-wal
+data/climate_mesh.db-shm
+data/demo_control.json
