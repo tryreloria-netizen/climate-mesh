@@ -31,6 +31,10 @@ def init_db():
             humidity REAL,
             air_quality REAL,
             water_level REAL,
+            wind_speed REAL,
+            wind_chill REAL,
+            heat_index REAL,
+            barometric_pressure REAL,
             timestamp TEXT NOT NULL
         );
 
@@ -69,16 +73,29 @@ def init_db():
         conn.execute("ALTER TABLE sensor_readings ADD COLUMN source TEXT DEFAULT 'simulation'")
         conn.commit()
 
+    # Migration: add GDX-WTHR channel columns if not exists
+    for col in ("wind_speed", "wind_chill", "heat_index", "barometric_pressure"):
+        try:
+            conn.execute(f"SELECT {col} FROM sensor_readings LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(f"ALTER TABLE sensor_readings ADD COLUMN {col} REAL")
+            conn.commit()
+
 
 def insert_reading(node_id: str, environment: str, temperature: float,
                    humidity: float, air_quality: float, water_level: float,
-                   source: str = "simulation"):
+                   source: str = "simulation",
+                   wind_speed: float = None, wind_chill: float = None,
+                   heat_index: float = None, barometric_pressure: float = None):
     conn = _get_conn()
     conn.execute(
-        "INSERT INTO sensor_readings (node_id, environment, temperature, humidity, air_quality, water_level, timestamp, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sensor_readings (node_id, environment, temperature, humidity, "
+        "air_quality, water_level, timestamp, source, wind_speed, wind_chill, "
+        "heat_index, barometric_pressure) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (node_id, environment, temperature, humidity, air_quality, water_level,
-         datetime.now().isoformat(), source)
+         datetime.now().isoformat(), source,
+         wind_speed, wind_chill, heat_index, barometric_pressure)
     )
     conn.commit()
 

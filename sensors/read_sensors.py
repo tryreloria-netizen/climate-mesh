@@ -63,8 +63,10 @@ class VernierMQ7SensorReader:
         # --- Vernier GDX-WTHR setup ---
         self._gdx = gdx_module.gdx()
         self._gdx.open(connection=gdx_connection)
-        # Channel 4 = Temperature (°C), Channel 7 = Relative Humidity (%)
-        self._gdx.select_sensors([4, 7])
+        # Channels: 1=Wind Speed, 3=Wind Chill, 4=Temperature, 5=Heat Index,
+        # 7=Relative Humidity, 10=Barometric Pressure
+        # Excluded: 2=Wind Direction, 6=Dew Point, 9=Station Pressure
+        self._gdx.select_sensors([1, 3, 4, 5, 7, 10])
         self._gdx.start(2000)  # 2-second polling interval
         logger.info(f"GDX-WTHR connected via {gdx_connection}")
 
@@ -77,19 +79,32 @@ class VernierMQ7SensorReader:
         self._last_good = {}
 
     def read_gdx(self) -> dict:
-        """Read temperature and humidity from GDX-WTHR."""
+        """Read weather channels from GDX-WTHR.
+
+        Channel order matches select_sensors([1, 3, 4, 5, 7, 10]):
+        [0]=Wind Speed, [1]=Wind Chill, [2]=Temperature,
+        [3]=Heat Index, [4]=Humidity, [5]=Barometric Pressure
+        """
         try:
             measurements = self._gdx.read()
-            if measurements is not None and len(measurements) >= 2:
+            if measurements is not None and len(measurements) >= 6:
                 result = {
-                    "temperature": round(measurements[0], 2),
-                    "humidity": round(measurements[1], 2),
+                    "wind_speed": round(measurements[0], 2),
+                    "wind_chill": round(measurements[1], 2),
+                    "temperature": round(measurements[2], 2),
+                    "heat_index": round(measurements[3], 2),
+                    "humidity": round(measurements[4], 2),
+                    "barometric_pressure": round(measurements[5], 2),
                 }
                 self._last_good["gdx"] = result
                 return result
         except Exception as e:
             logger.warning(f"GDX-WTHR read failed: {e}")
-        return self._last_good.get("gdx", {"temperature": None, "humidity": None})
+        return self._last_good.get("gdx", {
+            "temperature": None, "humidity": None,
+            "wind_speed": None, "wind_chill": None,
+            "heat_index": None, "barometric_pressure": None,
+        })
 
     def read_mq7(self) -> dict:
         """Read MQ-7 analog value via ADS1115 and convert to AQI estimate.
@@ -139,6 +154,10 @@ class SimulatedSensorReader:
             "humidity": round(60 + random.gauss(0, 5), 2),
             "air_quality": round(50 + random.gauss(0, 10), 2),
             "water_level": round(1.0 + random.gauss(0, 0.2), 2),
+            "wind_speed": round(8 + random.gauss(0, 3), 2),
+            "wind_chill": round(18 + random.gauss(0, 3), 2),
+            "heat_index": round(24 + random.gauss(0, 3), 2),
+            "barometric_pressure": round(1013 + random.gauss(0, 5), 2),
             "source": "simulation",
         }
 

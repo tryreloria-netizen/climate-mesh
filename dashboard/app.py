@@ -153,7 +153,8 @@ with tab_overview:
                 symbol="data_source",
                 color_continuous_scale=["green", "yellow", "orange", "red"],
                 range_color=[0, 100],
-                hover_data=["node_id", "temperature", "humidity", "air_quality", "water_level"],
+                hover_data=["node_id", "temperature", "humidity", "air_quality", "water_level",
+                            "wind_speed", "wind_chill", "heat_index", "barometric_pressure"],
                 size_max=40,
                 title="Node Risk Scores by Environment",
             )
@@ -201,6 +202,16 @@ with tab_nodes:
             c3.metric("Air Quality", f"{node_reading['air_quality']:.0f} AQI")
             c4.metric("Water Level", f"{node_reading['water_level']:.2f}m")
 
+            c5, c6, c7, c8 = st.columns(4)
+            ws = node_reading.get('wind_speed')
+            wc = node_reading.get('wind_chill')
+            hi = node_reading.get('heat_index')
+            bp = node_reading.get('barometric_pressure')
+            c5.metric("Wind Speed", f"{ws:.1f} m/s" if ws is not None else "N/A")
+            c6.metric("Wind Chill", f"{wc:.1f}°C" if wc is not None else "N/A")
+            c7.metric("Heat Index", f"{hi:.1f}°C" if hi is not None else "N/A")
+            c8.metric("Barometric Pressure", f"{bp:.1f} hPa" if bp is not None else "N/A")
+
             if not node_risk.empty:
                 risk_row = node_risk.iloc[0]
                 st.metric("Risk Score", f"{risk_row['score']:.1f}/100 ({risk_row['level']})")
@@ -213,7 +224,11 @@ with tab_nodes:
 
                 st.subheader("Sensor History (last 10 min)")
                 for sensor, unit in [("temperature", "°C"), ("humidity", "%"),
-                                     ("air_quality", "AQI"), ("water_level", "m")]:
+                                     ("air_quality", "AQI"), ("water_level", "m"),
+                                     ("wind_speed", "m/s"), ("wind_chill", "°C"),
+                                     ("heat_index", "°C"), ("barometric_pressure", "hPa")]:
+                    if sensor not in hist_df.columns or hist_df[sensor].isna().all():
+                        continue
                     fig = px.line(
                         hist_df, x="timestamp", y=sensor,
                         title=f"{sensor.replace('_', ' ').title()} ({unit})",
@@ -289,10 +304,12 @@ with tab_ai:
             sim_df = readings_df[readings_df["source"] == "simulation"]
 
             for sensor, unit in [("temperature", "°C"), ("humidity", "%"),
-                                 ("air_quality", "AQI"), ("water_level", "m")]:
+                                 ("air_quality", "AQI"), ("water_level", "m"),
+                                 ("wind_speed", "m/s"), ("wind_chill", "°C"),
+                                 ("heat_index", "°C"), ("barometric_pressure", "hPa")]:
                 col1, col2 = st.columns(2)
-                hw_val = hw_df[sensor].mean() if not hw_df.empty else 0
-                sim_val = sim_df[sensor].mean() if not sim_df.empty else 0
+                hw_val = hw_df[sensor].mean() if (not hw_df.empty and sensor in hw_df.columns) else 0
+                sim_val = sim_df[sensor].mean() if (not sim_df.empty and sensor in sim_df.columns) else 0
                 col1.metric(f"Hardware Avg {sensor.replace('_', ' ').title()}", f"{hw_val:.1f} {unit}")
                 col2.metric(f"Simulation Avg {sensor.replace('_', ' ').title()}", f"{sim_val:.1f} {unit}")
     else:
