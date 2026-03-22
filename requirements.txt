@@ -7,6 +7,6 @@ plotly>=5.18.0
 # Vernier Go Direct Weather sensor
 godirect
 
-# Raspberry Pi / hardware sensor support (install on Pi):
-#   pip install adafruit-circuitpython-ads1x15
-# adafruit-circuitpython-ads1x15
+# Raspberry Pi / hardware sensor support
+adafruit-blinka
+adafruit-circuitpython-ads1x15
