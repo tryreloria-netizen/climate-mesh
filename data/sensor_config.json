@@ -4,9 +4,7 @@
         {
             "node_id": "PI-01",
             "environment": "residential",
-            "dht22_pin": 4,
-            "hcsr04_trigger_pin": 17,
-            "hcsr04_echo_pin": 27,
+            "gdx_connection": "usb",
             "ads1115_channel": 0,
             "poll_interval_seconds": 2
         }

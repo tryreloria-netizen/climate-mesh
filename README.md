@@ -34,7 +34,7 @@ python run.py --mode auto         # Auto-detect (default)
 ## Architecture
 
 - **20 Simulated Nodes:** 5 river, 5 forest, 5 urban, 5 residential
-- **Pi Sensor Nodes:** Real hardware nodes (PI-01, etc.) run alongside simulation
+- **Hardware Nodes:** GDX-WTHR (temp/humidity) + MQ-7 (CO/air quality) nodes run alongside simulation
 - **SQLite (WAL mode):** Shared data bus for concurrent read/write
 - **Isolation Forest AI:** Trained on 2000 synthetic samples, detects anomalies in real-time
 - **Risk Engine:** Calculates 0-100 risk scores with 4 sub-components + AI multiplier
@@ -47,36 +47,38 @@ Use the dashboard buttons to trigger:
 - **Heatwave:** Temperatures spike, humidity drops, AQI rises
 - **Smog:** Air quality degrades dramatically in urban/residential areas
 
-## Raspberry Pi 5 Setup
+## Hardware Sensor Setup
 
-### Hardware
+### Sensors
 
 | Sensor | Purpose | Connection |
 |--------|---------|------------|
-| DHT22 | Temperature + Humidity | GPIO 4 (data pin) |
-| MQ-135 + ADS1115 | Air Quality (AQI) | I2C (SDA/SCL), Channel 0 |
-| HC-SR04 | Water Level (ultrasonic) | GPIO 17 (trigger), GPIO 27 (echo) |
+| Vernier GDX-WTHR | Temperature + Humidity | USB or Bluetooth (BLE) |
+| MQ-7 Flying Fish + ADS1115 | Air Quality (CO-based AQI) | I2C (SDA/SCL), Channel 0 |
 
-### Wiring
+Water level is simulated when using hardware sensors (neither sensor provides it).
+
+### Wiring (MQ-7)
 
 ```
-DHT22:     VCC -> 3.3V, GND -> GND, DATA -> GPIO 4
 ADS1115:   VCC -> 3.3V, GND -> GND, SDA -> GPIO 2, SCL -> GPIO 3
-MQ-135:    VCC -> 5V, GND -> GND, AOUT -> ADS1115 A0
-HC-SR04:   VCC -> 5V, GND -> GND, TRIG -> GPIO 17, ECHO -> GPIO 27
-           (Use voltage divider on ECHO: 1kΩ + 2kΩ to bring 5V down to 3.3V)
+MQ-7:     VCC -> 5V, GND -> GND, AO -> ADS1115 A0
 ```
 
-### Pi Software Setup
+The GDX-WTHR connects via USB cable or Bluetooth — no GPIO wiring needed.
+
+### Software Setup
 
 ```bash
 pip install -r requirements.txt
-pip install adafruit-circuitpython-dht adafruit-circuitpython-ads1x15 RPi.GPIO
+pip install adafruit-circuitpython-ads1x15
 ```
+
+You also need the `gdx` helper module from [VernierST/godirect-examples](https://github.com/VernierST/godirect-examples) — place the `gdx/` folder in the project root.
 
 ### Configuration
 
-Edit `data/sensor_config.json` to set pin numbers and mode:
+Edit `data/sensor_config.json` to set connection type and mode:
 
 ```json
 {
@@ -85,9 +87,7 @@ Edit `data/sensor_config.json` to set pin numbers and mode:
         {
             "node_id": "PI-01",
             "environment": "residential",
-            "dht22_pin": 4,
-            "hcsr04_trigger_pin": 17,
-            "hcsr04_echo_pin": 27,
+            "gdx_connection": "usb",
             "ads1115_channel": 0,
             "poll_interval_seconds": 2
         }
@@ -95,7 +95,7 @@ Edit `data/sensor_config.json` to set pin numbers and mode:
 }
 ```
 
-The system auto-detects whether it's running on a Pi. On a regular PC, it runs in pure simulation mode with no errors.
+Set `gdx_connection` to `"ble"` for Bluetooth. The system auto-detects available hardware. On a regular PC without sensors, it runs in pure simulation mode.
 
 ## Project Structure
 
@@ -115,5 +115,5 @@ climate-mesh/
     dashboard/
         app.py                   # Streamlit dashboard
     sensors/
-        read_sensors.py          # Pi hardware + simulation fallback
+        read_sensors.py          # GDX-WTHR + MQ-7 hardware + simulation fallback
 ```

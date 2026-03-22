@@ -4,8 +4,9 @@ pandas>=2.0.0
 numpy>=1.24.0
 plotly>=5.18.0
 
-# Raspberry Pi 5 only (install on Pi with the command below):
-#   pip install adafruit-circuitpython-dht adafruit-circuitpython-ads1x15 RPi.GPIO
-# adafruit-circuitpython-dht
+# Vernier Go Direct Weather sensor
+godirect
+
+# Raspberry Pi / hardware sensor support (install on Pi):
+#   pip install adafruit-circuitpython-ads1x15
 # adafruit-circuitpython-ads1x15
-# RPi.GPIO
