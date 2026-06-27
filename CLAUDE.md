@@ -4,53 +4,68 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Climate Mesh is a decentralized climate monitoring system that simulates 20 environmental sensor nodes, detects anomalies via Isolation Forest, calculates risk scores, and displays a real-time Streamlit dashboard. It also supports hardware sensors (Vernier GDX-WTHR for temperature/humidity, MQ-7 Flying Fish for CO-based air quality) alongside simulation.
+Climate Mesh is a decentralised climate-monitoring and AI early-warning system that runs on a Raspberry Pi 5. It models 20 named London/Harrow nodes, scores each one's climate risk 0–100, detects anomalies with an explainable Isolation Forest, escalates correlated events across adjacent nodes (mesh correlation), and raises plain-English alerts with action playbooks. A 7-tab Streamlit dashboard reads from a shared SQLite database.
+
+**Sensor-ready, not sensor-dependent.** The full pipeline works with no physical sensors and (optionally) no internet. Every reading is labelled with its `source` (`simulation` / `demo` / `api` / `hardware`); simulated data is never presented as hardware data.
 
 ## Commands
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 
-# Run simulation + risk engine (Terminal 1)
-python run.py
+# Engine (Terminal 1)
+python run.py --mode simulation                       # offline default
+python run.py --mode demo --scenario flood --judge-mode   # best for screenshots
+python run.py --mode api                              # live Open-Meteo (falls back)
+python run.py --mode hardware                         # physical sensor (falls back)
+python run.py --mode auto                             # hardware -> api -> simulation
+python run.py --mode demo --scenario flood --once     # one cycle (CI)
 
-# Run dashboard (Terminal 2)
+# Dashboard (Terminal 2)
 python -m streamlit run dashboard/app.py
 
-# Force a specific sensor mode
-python run.py --mode simulation   # Simulation only (default on PC)
-python run.py --mode pi           # Hardware sensors
-python run.py --mode auto         # Auto-detect
+# Tests / evidence
+pytest
+python scripts/smoke_test.py
+python scripts/run_validation.py --mode demo --scenario flood
+python scripts/export_evidence.py
+python scripts/reset_demo_db.py
 ```
 
-There are no tests or linting configured in this project.
+Modes: `simulation`, `demo`, `api`, `hardware`, `auto`. Scenarios: `normal`, `flood`, `heatwave`, `smog`, `storm`. `--judge-mode` freezes the clock for deterministic, screenshot-stable output.
 
 ## Architecture
 
-The system runs as two separate processes that communicate through a shared SQLite database (WAL mode):
+Two processes share a SQLite database (WAL mode) as a message bus:
 
-**Process 1 (`run.py`)** — launches four concurrent async tasks via `asyncio.gather`:
-- `run_simulation()` — generates readings every 2s for 20 nodes (5 each: river, forest, urban, residential)
-- `run_pi_sensors()` — reads real hardware sensors if configured, inserts alongside simulated data
-- `run_risk_engine()` — every 3s, reads latest per-node readings, calculates risk scores (4 sub-scores 0-25 each + AI anomaly multiplier 1.0-1.5x), writes alerts
-- `periodic_cleanup()` — purges data older than 30 minutes every 5 minutes
+**Engine (`run.py`)** runs three async tasks: a sensor loop (an adapter produces one canonical reading per node each tick and inserts them), `run_risk_engine` (scores every node every 3s and writes risk + alerts), and a cleanup loop (purges data older than 30 min). `--once` runs a single synchronous cycle for tests/CI.
 
-**Process 2 (`dashboard/app.py`)** — Streamlit dashboard that reads from the same SQLite DB, auto-refreshes every 2s via `time.sleep(2)` + `st.rerun()`.
+**Dashboard (`dashboard/app.py`)** is a pure reader: 7 tabs, auto-refresh via `time.sleep(2)` + `st.rerun()`. Live scenario buttons write `data/demo_control.json`, which the engine's sensor loop reads each tick.
 
-**Demo scenarios** (flood, heatwave, smog) are controlled via a `data/demo_control.json` file — the dashboard writes it, the simulation reads it.
+## The canonical reading contract
 
-## Node ID Convention
+The core design idea: **every data source emits the same reading dict** (see `sensors/base.py:make_reading` / `MEASUREMENT_FIELDS`). Keys: `node_id, node_name, environment, latitude, longitude, temperature, humidity, air_quality, water_level, wind_speed, wind_chill, heat_index, barometric_pressure, source, is_simulated, quality_flag, scenario, timestamp`. The risk engine, AI, database, and dashboard never branch on where a reading came from. To add a sensor, write one adapter — nothing else changes.
 
-Simulated nodes use environment-prefixed IDs: `RV-01`..`RV-05` (river), `FR-01`..`FR-05` (forest), `UB-01`..`UB-05` (urban), `RS-01`..`RS-05` (residential). Hardware Pi nodes use `PI-01`, etc.
+Adapters (`sensors/`): `SimulatedAdapter` (simulation/demo), `ApiAdapter` (live Open-Meteo, raises `ApiUnavailable` → caller falls back), `VernierAdapter` (one physical node over a simulated mesh; never crashes without hardware). `sensors/__init__.py:create_adapter(mode)` is the factory and owns all fallback decisions, returning `(adapter, notes)`.
 
-## Vendored Packages
+## Nodes & scenarios
 
-The `packages/` directory contains pre-downloaded `.whl` files for offline installation (streamlit, pandas, numpy, etc.).
+`config/nodes.py` defines 20 nodes with real coordinates and a distance-based mesh neighbour map (`NEIGHBOURS`, ≤6 km). Environments: `school, river, residential, urban, park`. `simulation/scenarios.py` holds per-environment deltas for each scenario; `simulation/engine.py` generates values (daily cycle + noise + gradual scenario ramp + neighbour correlation). Deterministic mode (demo/judge) seeds RNG per node so screenshots are stable.
 
-## Key Design Decisions
+## Risk model
 
-- **SQLite as message bus**: All inter-process communication goes through `data/climate_mesh.db`. The `data/database.py` module provides thread-local connections with WAL mode and busy timeout.
-- **Sensor mode override**: The `CLIMATE_MESH_MODE` env var (set by `--mode` flag) takes priority over `data/sensor_config.json`. The `sensors/read_sensors.py` factory returns either `VernierMQ7SensorReader` (GDX-WTHR + MQ-7 via ADS1115) or `SimulatedSensorReader`. Water level is always simulated since neither hardware sensor provides it.
-- **AI model trains on synthetic data**: `AnomalyDetector.train()` generates 2000 synthetic normal samples at startup — no external training data needed.
-- **Risk score**: Sum of 4 sub-scores (temp, humidity, AQI, water level, each 0-25) multiplied by AI anomaly factor. Levels: safe (<30), moderate (30-59), warning (60-79), critical (80+).
+`backend/risk_engine.py`: six 0–100 hazard sub-scores (temp, humidity, AQI, water, wind, pressure) → base = `worst + 0.20 * sum(rest)`, capped 100 → `× AI multiplier (1.0–1.5)` `× mesh multiplier (1.2 if ≥2 neighbours elevated)`. Levels: SAFE <30, MODERATE 30–60, WARNING 60–80, CRITICAL 80+. Each result carries `top_factors`, `correlated`, and a plain-English `explanation`. Alerts are cooldown-gated (45 s; re-fire only on severity change) and carry a `playbook` from `backend/playbooks.py`.
+
+## Database
+
+`data/database.py` is the only module that knows table shapes: `sensor_readings`, `risk_scores` (with sub-scores, multipliers, `top_factors` JSON, `explanation`), `alerts` (with `playbook`), and `run_meta` (for evidence). Point the DB elsewhere with the `CLIMATE_MESH_DB` env var (tests and scripts use a temp file).
+
+## Tests
+
+`pytest` (33 tests in `tests/`). `conftest.py` pins an isolated temp DB and resets it per test. Coverage: reading shape, risk bounds/thresholds, scenario effects, mesh correlation, DB round-trips, alert cooldown, hardware-fallback-never-crashes.
+
+## Honesty rules (do not regress)
+
+- Never fabricate physical-sensor data. Anything not from real hardware is `is_simulated = True`.
+- Always keep the `source` and `quality_flag` on every reading and in exports.
+- It's a two-person team (Leo & Luis) — see `docs/writeup_corrections.md`.
