@@ -1,12 +1,18 @@
+# --- Core (required to run the full pipeline + dashboard) ---
 streamlit>=1.30.0
 scikit-learn>=1.3.0
 pandas>=2.0.0
 numpy>=1.24.0
 plotly>=5.18.0
 
-# Vernier Go Direct Weather sensor
-godirect
+# --- Tests (the README/Pi guide run `pytest`) ---
+pytest>=7.4.0
 
-# Raspberry Pi / hardware sensor support
-adafruit-blinka
-adafruit-circuitpython-ads1x15
+# --- Optional: physical Raspberry Pi sensors (NOT required for the demo) ---
+# Climate Mesh runs fully without these. Install them only when connecting a
+# real Vernier Go Direct Weather sensor / MQ-7 air-quality channel.
+#   pip install godirect adafruit-blinka adafruit-circuitpython-ads1x15
+# They are commented out so a fresh clone installs cleanly on any machine.
+# godirect
+# adafruit-blinka
+# adafruit-circuitpython-ads1x15

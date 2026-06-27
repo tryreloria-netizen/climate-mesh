@@ -1,93 +1,107 @@
-"""Isolation Forest anomaly detection for Climate Mesh."""
+"""Isolation Forest anomaly detection for Climate Mesh.
+
+Unlike fixed thresholds, an Isolation Forest learns the normal multivariate
+shape of the data and flags readings that are easy to isolate — catching
+*developing* anomalies (an unusual combination of values) before any single
+channel crosses a hard limit. The model trains on synthetic normal samples at
+startup, so no external data or internet is required.
+
+The output is explainable: alongside the anomaly score it returns the channels
+that deviate most from the learned baseline, which the risk engine folds into
+its plain-English explanation.
+"""
+
+from __future__ import annotations
 
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
+# Feature order used everywhere in this module.
+FEATURES = ("temperature", "humidity", "air_quality", "water_level",
+            "wind_speed", "barometric_pressure")
 
-def generate_training_data(n_samples: int = 2000) -> np.ndarray:
-    """Generate synthetic normal sensor data for training."""
-    rng = np.random.default_rng(42)
-    data = np.column_stack([
-        rng.normal(25, 4, n_samples),      # temperature (°C)
-        rng.normal(60, 12, n_samples),      # humidity (%)
-        rng.normal(70, 30, n_samples),      # air_quality (AQI)
-        rng.normal(1.0, 0.5, n_samples),    # water_level (m)
-    ])
-    # Clamp to reasonable ranges
-    data[:, 0] = np.clip(data[:, 0], -10, 50)
-    data[:, 1] = np.clip(data[:, 1], 0, 100)
-    data[:, 2] = np.clip(data[:, 2], 0, 300)
-    data[:, 3] = np.clip(data[:, 3], 0, 5)
+# Means/spreads of the synthetic "normal" London-ish distribution. Spreads are
+# wide enough that ordinary seasonal variation (a warm summer day, a breezy
+# afternoon) is NOT flagged as anomalous, while genuine scenario extremes still
+# sit well outside the learned envelope.
+_NORMAL = {
+    "temperature": (16.0, 8.0),
+    "humidity": (68.0, 15.0),
+    "air_quality": (55.0, 30.0),
+    "water_level": (0.7, 0.6),
+    "wind_speed": (5.0, 3.0),
+    "barometric_pressure": (1013.0, 9.0),
+}
+_HUMAN = {
+    "temperature": "temperature",
+    "humidity": "humidity",
+    "air_quality": "air quality",
+    "water_level": "water level",
+    "wind_speed": "wind speed",
+    "barometric_pressure": "pressure",
+}
+
+
+def generate_training_data(n_samples: int = 2000, seed: int = 42) -> np.ndarray:
+    """Generate synthetic normal sensor data for training (deterministic)."""
+    rng = np.random.default_rng(seed)
+    cols = [rng.normal(_NORMAL[f][0], _NORMAL[f][1], n_samples) for f in FEATURES]
+    data = np.column_stack(cols)
+    clamps = [(-15, 55), (0, 100), (0, 500), (0, 12), (0, 60), (940, 1060)]
+    for i, (lo, hi) in enumerate(clamps):
+        data[:, i] = np.clip(data[:, i], lo, hi)
     return data
 
 
 class AnomalyDetector:
-    """Wraps IsolationForest for sensor anomaly detection."""
+    """Wraps IsolationForest for explainable sensor anomaly detection."""
 
     def __init__(self):
-        self.model = IsolationForest(
-            n_estimators=100,
-            contamination=0.05,
-            random_state=42,
-        )
+        self.model = IsolationForest(n_estimators=120, contamination=0.05, random_state=42)
         self.scaler = StandardScaler()
         self.trained = False
 
-    def train(self):
-        """Train on synthetic normal data."""
+    def train(self, quiet: bool = False) -> "AnomalyDetector":
         data = generate_training_data()
         self.scaler.fit(data)
         self.model.fit(self.scaler.transform(data))
         self.trained = True
-        print("[AI] Anomaly detector trained on 2000 synthetic samples")
+        if not quiet:
+            print("[AI] Isolation Forest trained on 2000 synthetic normal samples")
+        return self
 
-    def predict(self, temperature: float, humidity: float,
-                air_quality: float, water_level: float) -> dict:
-        """Predict anomaly for a single reading.
+    def _feature_vector(self, reading: dict) -> np.ndarray:
+        return np.array([[float(reading.get(f, _NORMAL[f][0])) for f in FEATURES]])
 
-        Returns dict with 'is_anomaly' (bool), 'score' (0-1), 'explanation' (str).
-        """
+    def top_factors(self, reading: dict, k: int = 3) -> list[str]:
+        """Channels deviating most from the learned baseline (in sigma units)."""
+        devs = []
+        for f in FEATURES:
+            mu, sd = _NORMAL[f]
+            z = abs(float(reading.get(f, mu)) - mu) / sd if sd else 0.0
+            devs.append((z, _HUMAN[f]))
+        devs.sort(reverse=True)
+        return [name for z, name in devs[:k] if z > 1.0]
+
+    def predict(self, reading: dict) -> dict:
+        """Score one reading. Returns is_anomaly, score (0-1), explanation, factors."""
         if not self.trained:
-            return {"is_anomaly": False, "score": 0.0, "explanation": "Model not trained"}
+            return {"is_anomaly": False, "score": 0.0,
+                    "explanation": "model not trained", "factors": []}
 
-        features = np.array([[temperature, humidity, air_quality, water_level]])
-        scaled = self.scaler.transform(features)
+        scaled = self.scaler.transform(self._feature_vector(reading))
+        raw = float(self.model.decision_function(scaled)[0])  # >0 normal, <0 anomaly
+        is_anomaly = self.model.predict(scaled)[0] == -1
+        score = max(0.0, min(1.0, 0.5 - raw))  # higher = more anomalous
 
-        # decision_function: negative = anomaly, positive = normal
-        raw_score = self.model.decision_function(scaled)[0]
-        prediction = self.model.predict(scaled)[0]  # 1 = normal, -1 = anomaly
-
-        is_anomaly = prediction == -1
-        # Convert raw score to 0-1 range (higher = more anomalous)
-        anomaly_score = max(0.0, min(1.0, 0.5 - raw_score))
-
-        # Generate explanation
-        explanations = []
-        if temperature > 40:
-            explanations.append(f"extreme high temperature ({temperature:.1f}°C)")
-        elif temperature < 0:
-            explanations.append(f"extreme low temperature ({temperature:.1f}°C)")
-        if humidity > 90:
-            explanations.append(f"very high humidity ({humidity:.1f}%)")
-        elif humidity < 15:
-            explanations.append(f"very low humidity ({humidity:.1f}%)")
-        if air_quality > 200:
-            explanations.append(f"dangerous air quality (AQI {air_quality:.0f})")
-        elif air_quality > 150:
-            explanations.append(f"unhealthy air quality (AQI {air_quality:.0f})")
-        if water_level > 4:
-            explanations.append(f"critical water level ({water_level:.2f}m)")
-        elif water_level > 3:
-            explanations.append(f"high water level ({water_level:.2f}m)")
-
-        if is_anomaly and not explanations:
-            explanations.append("unusual combination of sensor values")
-
-        explanation = "; ".join(explanations) if explanations else "normal conditions"
-
+        factors = self.top_factors(reading)
+        if is_anomaly and not factors:
+            factors = ["an unusual combination of readings"]
+        explanation = (", ".join(factors) if factors else "normal conditions")
         return {
-            "is_anomaly": is_anomaly,
-            "score": round(anomaly_score, 3),
+            "is_anomaly": bool(is_anomaly),
+            "score": round(score, 3),
             "explanation": explanation,
+            "factors": factors,
         }
