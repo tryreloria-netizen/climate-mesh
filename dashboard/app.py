@@ -1,320 +1,372 @@
-"""Streamlit dashboard for Climate Mesh."""
+"""Streamlit dashboard for Climate Mesh.
+
+Seven tabs (Live Map, Network Overview, Node Detail, AI Explainability,
+Evidence & Validation, Hardware Readiness, Competition Pitch). The dashboard is
+a pure *reader* of the shared SQLite database — the engine process (``run.py``)
+writes; this displays. Data-source labels and the active mode are shown
+prominently so nobody mistakes simulated or API data for physical-sensor data.
+"""
+
+from __future__ import annotations
 
 import json
-import time
 import sys
+import time
 from pathlib import Path
 
-import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 
-# Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from backend.playbooks import playbook_for
+from config.nodes import NODES
 from data.database import (
-    init_db, get_latest_readings_per_node, get_risk_scores,
-    get_alerts, get_node_history,
+    get_alerts, get_latest_readings_per_node, get_latest_run_meta,
+    get_node_history, get_risk_scores, init_db,
 )
+from sensors.hardware_status import detect
+from simulation.scenarios import SCENARIO_INFO, SCENARIOS
 
 DEMO_CONTROL_PATH = Path(__file__).parent.parent / "data" / "demo_control.json"
 
-# Page config
-st.set_page_config(
-    page_title="Climate Mesh Dashboard",
-    page_icon="🌍",
-    layout="wide",
-)
-
-# Initialize DB connection for dashboard process
+st.set_page_config(page_title="Climate Mesh", page_icon="🌍", layout="wide")
 init_db()
 
+LEVEL_ICON = {"SAFE": "🟢", "MODERATE": "🟡", "WARNING": "🟠", "CRITICAL": "🔴"}
+SOURCE_LABEL = {
+    "simulation": "💻 Simulation (synthetic, offline)",
+    "demo": "🎬 Demo (deterministic, screenshot-stable)",
+    "api": "🌐 Live API (Open-Meteo real data)",
+    "hardware": "📡 Hardware (physical Vernier sensor)",
+}
 
-# --- Demo Control ---
-def _write_demo_control(scenario: str | None):
+
+def _write_scenario(scenario: str) -> None:
     DEMO_CONTROL_PATH.parent.mkdir(parents=True, exist_ok=True)
     DEMO_CONTROL_PATH.write_text(json.dumps({"scenario": scenario}))
 
 
-st.title("Climate Mesh Dashboard")
-
-# Demo control buttons
-cols = st.columns(5)
-with cols[0]:
-    if st.button("Trigger Flood", type="primary", use_container_width=True):
-        _write_demo_control("flood")
-        st.toast("Flood scenario activated!")
-with cols[1]:
-    if st.button("Trigger Heatwave", type="primary", use_container_width=True):
-        _write_demo_control("heatwave")
-        st.toast("Heatwave scenario activated!")
-with cols[2]:
-    if st.button("Trigger Smog", type="primary", use_container_width=True):
-        _write_demo_control("smog")
-        st.toast("Smog scenario activated!")
-with cols[3]:
-    if st.button("Stop Scenario", type="secondary", use_container_width=True):
-        _write_demo_control(None)
-        st.toast("Scenario stopped — returning to normal")
-with cols[4]:
-    # Show active scenario
+def _active_scenario() -> str:
     try:
-        ctrl = json.loads(DEMO_CONTROL_PATH.read_text()) if DEMO_CONTROL_PATH.exists() else {}
-        active = ctrl.get("scenario")
-        if active:
-            st.warning(f"Active: {active.upper()}")
-        else:
-            st.success("Normal conditions")
-    except Exception:
-        st.info("No scenario")
+        if DEMO_CONTROL_PATH.exists():
+            return json.loads(DEMO_CONTROL_PATH.read_text()).get("scenario") or "normal"
+    except (json.JSONDecodeError, OSError):
+        pass
+    return "normal"
 
-st.divider()
 
-# --- Fetch data ---
+def _scatter_map(df: pd.DataFrame):
+    """Build a risk-coloured map, tolerating both old and new plotly APIs."""
+    common = dict(
+        lat="latitude", lon="longitude", color="score", size="size",
+        color_continuous_scale=["#2ecc71", "#f1c40f", "#e67e22", "#e74c3c"],
+        range_color=[0, 100], size_max=22, zoom=8.5,
+        center={"lat": 51.51, "lon": -0.16}, hover_name="node_name",
+        hover_data={"node_id": True, "level": True, "score": ":.0f",
+                    "source": True, "latitude": False, "longitude": False, "size": False},
+    )
+    try:  # plotly >= 5.24 (maplibre)
+        fig = px.scatter_map(df, map_style="open-street-map", **common)
+    except AttributeError:  # older plotly (mapbox)
+        fig = px.scatter_mapbox(df, mapbox_style="open-street-map", **common)
+    fig.update_layout(height=520, margin=dict(l=0, r=0, t=0, b=0))
+    return fig
+
+
+# --- Load data ------------------------------------------------------------
 readings = get_latest_readings_per_node()
 risks = get_risk_scores()
-alerts = get_alerts(limit=30)
+alerts = get_alerts(limit=40)
+run_meta = get_latest_run_meta() or {}
 
 readings_df = pd.DataFrame(readings) if readings else pd.DataFrame()
 risks_df = pd.DataFrame(risks) if risks else pd.DataFrame()
-alerts_df = pd.DataFrame(alerts) if alerts else pd.DataFrame()
 
-# --- Build source map (node_id -> "hardware" or "simulation") ---
-source_map = {}
-if not readings_df.empty and "source" in readings_df.columns:
-    source_map = dict(zip(readings_df["node_id"], readings_df["source"]))
+merged = pd.DataFrame()
+if not readings_df.empty and not risks_df.empty:
+    merged = readings_df.merge(
+        risks_df[["node_id", "score", "level", "anomaly_score", "ai_multiplier",
+                  "mesh_multiplier", "correlated", "temp_sub", "humidity_sub",
+                  "aqi_sub", "water_sub", "wind_sub", "pressure_sub",
+                  "explanation", "top_factors"]],
+        on="node_id", how="left",
+    )
+    merged["size"] = merged["score"].clip(lower=8)
 
-live_count = sum(1 for s in source_map.values() if s == "hardware")
+sources_present = sorted(readings_df["source"].unique()) if not readings_df.empty else []
+mode = run_meta.get("mode", "simulation")
+configured_source = run_meta.get("source", "simulation")
+active_scenario = _active_scenario()
 
-# --- Sidebar: Node list with risk indicators ---
+# --- Header + mode banner -------------------------------------------------
+st.title("🌍 Climate Mesh")
+st.caption("Decentralised climate monitoring & AI-powered early-warning mesh — Harrow / London")
+
+banner = st.container()
+with banner:
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+    c1.metric("Mode", mode.upper())
+    c2.metric("Data source", configured_source.upper())
+    c3.metric("Active scenario", active_scenario.upper())
+    c4.metric("Nodes online", f"{len(readings_df)}/20" if not readings_df.empty else "0/20")
+    if sources_present:
+        st.info("**Data source(s) in view:** " + " · ".join(
+            SOURCE_LABEL.get(s, s) for s in sources_present))
+
+if readings_df.empty:
+    st.warning("No data yet. Start the engine in another terminal:  "
+               "`python run.py --mode demo --scenario flood --judge-mode`")
+
+# --- Sidebar --------------------------------------------------------------
 with st.sidebar:
-    st.header("Sensor Nodes")
-
-    if live_count > 0:
-        st.success(f"📡 {live_count} live sensor(s) connected")
-
+    st.header("Scenario controls")
+    st.caption("Applies calibrated deltas on top of live/simulated data — it does "
+               "not replace real values with invented ones.")
+    cols = st.columns(2)
+    for i, sc in enumerate(SCENARIOS):
+        if cols[i % 2].button(SCENARIO_INFO[sc]["label"], use_container_width=True,
+                              type="primary" if sc == active_scenario else "secondary"):
+            _write_scenario(sc)
+            st.rerun()
+    st.divider()
+    st.header("Nodes")
     if not risks_df.empty:
         for _, row in risks_df.iterrows():
-            level = row["level"]
-            color_map = {"safe": "🟢", "moderate": "🟡", "warning": "🟠", "critical": "🔴"}
-            icon = color_map.get(level, "⚪")
-            node_source = source_map.get(row["node_id"], "simulation")
-            live_tag = " `[LIVE]`" if node_source == "hardware" else ""
-            st.markdown(f"{icon} **{row['node_id']}**{live_tag} — {row['score']:.0f}/100 ({level})")
+            icon = LEVEL_ICON.get(row["level"], "⚪")
+            st.markdown(f"{icon} **{row['node_id']}** — {row['score']:.0f}/100")
     else:
-        st.info("Waiting for data... Make sure `python run.py` is running.")
-
+        st.info("Waiting for data…")
     st.divider()
-    st.caption("Climate Mesh v1.0")
-    st.caption("Auto-refreshes every 2s")
+    refresh = st.checkbox("Auto-refresh (2s)", value=True)
+    st.caption("Climate Mesh v2.0 · honest by design")
 
-# --- Tabs ---
-tab_overview, tab_nodes, tab_ai = st.tabs(["Overview", "Node Details", "AI Insights"])
+# --- Tabs -----------------------------------------------------------------
+tabs = st.tabs([
+    "🗺️ Live Map", "📊 Network Overview", "🔬 Node Detail", "🤖 AI Explainability",
+    "🧾 Evidence & Validation", "🔌 Hardware Readiness", "🏆 Competition Pitch",
+])
 
-# === OVERVIEW TAB ===
-with tab_overview:
-    if not readings_df.empty and not risks_df.empty:
-        # KPI metrics
-        m1, m2, m3, m4, m5 = st.columns(5)
+# === LIVE MAP =============================================================
+with tabs[0]:
+    info = SCENARIO_INFO.get(active_scenario, {})
+    st.subheader(f"Live risk map — scenario: {info.get('label', active_scenario)}")
+    if info.get("blurb"):
+        st.caption(info["blurb"])
+    if not merged.empty:
+        st.plotly_chart(_scatter_map(merged), use_container_width=True)
+        st.caption("Marker colour & size = risk score (green safe → red critical).")
+    else:
+        st.info("Map appears once the engine is running.")
+
+# === NETWORK OVERVIEW =====================================================
+with tabs[1]:
+    if not merged.empty:
         avg_risk = risks_df["score"].mean()
-        critical_count = len(risks_df[risks_df["level"] == "critical"])
-        avg_temp = readings_df["temperature"].mean()
-        avg_aqi = readings_df["air_quality"].mean()
+        highest = risks_df.iloc[0]
+        active_alerts = len([a for a in alerts if a["severity"] in ("warning", "critical")])
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Average risk", f"{avg_risk:.1f}/100")
+        m2.metric("Highest-risk node", highest["node_id"], f"{highest['score']:.0f}/100")
+        m3.metric("Active alerts", active_alerts)
+        m4.metric("Avg temp / AQI", f"{readings_df['temperature'].mean():.1f}°C / "
+                                    f"{readings_df['air_quality'].mean():.0f}")
 
-        m1.metric("Avg Risk Score", f"{avg_risk:.1f}/100")
-        m2.metric("Critical Nodes", f"{critical_count}/{len(risks_df)}")
-        m3.metric("Avg Temperature", f"{avg_temp:.1f}°C")
-        m4.metric("Avg AQI", f"{avg_aqi:.0f}")
-        m5.metric("Live Sensors", f"{live_count}/{len(readings_df)}")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.subheader("Risk by node")
+            bar = px.bar(risks_df.sort_values("score"), x="score", y="node_id",
+                         orientation="h", color="score", range_color=[0, 100],
+                         color_continuous_scale=["#2ecc71", "#f1c40f", "#e67e22", "#e74c3c"])
+            bar.add_vline(x=60, line_dash="dash", line_color="orange")
+            bar.add_vline(x=80, line_dash="dash", line_color="red")
+            bar.update_layout(height=460, margin=dict(t=10, b=10))
+            st.plotly_chart(bar, use_container_width=True)
+        with cc2:
+            st.subheader("Risk distribution")
+            counts = risks_df["level"].value_counts().reindex(
+                ["SAFE", "MODERATE", "WARNING", "CRITICAL"], fill_value=0)
+            pie = px.pie(values=counts.values, names=counts.index,
+                         color=counts.index,
+                         color_discrete_map={"SAFE": "#2ecc71", "MODERATE": "#f1c40f",
+                                             "WARNING": "#e67e22", "CRITICAL": "#e74c3c"})
+            pie.update_layout(height=300, margin=dict(t=10, b=10))
+            st.plotly_chart(pie, use_container_width=True)
+            st.subheader("Weather / AQI summary")
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Humidity", f"{readings_df['humidity'].mean():.0f}%")
+            s2.metric("Wind", f"{readings_df['wind_speed'].mean():.1f} m/s")
+            s3.metric("Pressure", f"{readings_df['barometric_pressure'].mean():.0f} hPa")
 
-        st.subheader("Risk Score Heatmap")
-
-        # Scatter plot as risk visualization
-        merged = readings_df.merge(risks_df[["node_id", "score", "level"]], on="node_id", how="left")
-        if not merged.empty:
-            # Create grid positions for nodes
-            merged["node_num"] = merged["node_id"].str.extract(r"(\d+)$").astype(int)
-
-            # Add source info for marker differentiation
-            if "source" in merged.columns:
-                merged["data_source"] = merged["source"].apply(
-                    lambda s: "Live Hardware" if s == "hardware" else "Simulation"
-                )
-            else:
-                merged["data_source"] = "Simulation"
-
-            fig = px.scatter(
-                merged,
-                x="node_num",
-                y="environment",
-                size="score",
-                color="score",
-                symbol="data_source",
-                color_continuous_scale=["green", "yellow", "orange", "red"],
-                range_color=[0, 100],
-                hover_data=["node_id", "temperature", "humidity", "air_quality", "water_level",
-                            "wind_speed", "wind_chill", "heat_index", "barometric_pressure"],
-                size_max=40,
-                title="Node Risk Scores by Environment",
-            )
-            fig.update_layout(
-                xaxis_title="Node Number",
-                yaxis_title="Environment",
-                height=350,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        # Alert feed
-        st.subheader("Recent Alerts")
-        if not alerts_df.empty:
-            for _, alert in alerts_df.head(10).iterrows():
-                severity = alert["severity"]
-                icon = "🔴" if severity == "critical" else "🟠" if severity == "warning" else "🟡"
-                ts = alert["timestamp"].split("T")[1].split(".")[0] if "T" in alert["timestamp"] else alert["timestamp"]
-                st.markdown(f"{icon} **[{ts}]** `{alert['node_id']}` — {alert['message']}")
+        st.subheader("Recent alerts")
+        if alerts:
+            for a in alerts[:12]:
+                icon = "🔴" if a["severity"] == "critical" else "🟠"
+                ts = a["timestamp"].split("T")[1][:8] if "T" in a["timestamp"] else a["timestamp"]
+                st.markdown(f"{icon} **[{ts}]** `{a['node_id']}` — {a['message']}")
         else:
-            st.info("No alerts yet")
+            st.success("No active alerts — all nodes within safe parameters.")
     else:
-        st.info("Waiting for sensor data... Make sure `python run.py` is running in another terminal.")
+        st.info("Waiting for sensor data…")
 
-# === NODE DETAILS TAB ===
-with tab_nodes:
+# === NODE DETAIL ==========================================================
+with tabs[2]:
     if not readings_df.empty:
-        node_ids = sorted(readings_df["node_id"].tolist())
-        selected_node = st.selectbox("Select Node", node_ids)
+        node_id = st.selectbox("Select node", sorted(readings_df["node_id"]))
+        row = readings_df[readings_df["node_id"] == node_id].iloc[0]
+        rrow = risks_df[risks_df["node_id"] == node_id]
+        st.markdown(f"### {row.get('node_name', node_id)}  ·  `{node_id}`")
+        st.info(f"**Data source:** {SOURCE_LABEL.get(row['source'], row['source'])}  "
+                f"·  **Quality flag:** `{row['quality_flag']}`  "
+                f"·  **Scenario:** `{row['scenario']}`")
 
-        if selected_node:
-            # Data source indicator
-            node_source = source_map.get(selected_node, "simulation")
-            if node_source == "hardware":
-                st.success("📡 Data Source: **Real Hardware** (DHT22 / MQ-135 / HC-SR04)")
-            else:
-                st.info("💻 Data Source: **Simulation** (synthetic sensor data)")
+        c = st.columns(4)
+        c[0].metric("Temperature", f"{row['temperature']:.1f}°C")
+        c[1].metric("Humidity", f"{row['humidity']:.0f}%")
+        c[2].metric("Air quality", f"{row['air_quality']:.0f} AQI")
+        c[3].metric("Water level", f"{row['water_level']:.2f} m")
+        c = st.columns(4)
+        c[0].metric("Wind speed", f"{row['wind_speed']:.1f} m/s")
+        c[1].metric("Wind chill", f"{row['wind_chill']:.1f}°C")
+        c[2].metric("Heat index", f"{row['heat_index']:.1f}°C")
+        c[3].metric("Pressure", f"{row['barometric_pressure']:.0f} hPa")
 
-            # Current reading
-            node_reading = readings_df[readings_df["node_id"] == selected_node].iloc[0]
-            node_risk = risks_df[risks_df["node_id"] == selected_node]
+        if not rrow.empty:
+            r = rrow.iloc[0]
+            st.metric("Risk score", f"{r['score']:.0f}/100", r["level"])
+            st.markdown(f"**Why:** {r['explanation']}")
+            subs = {"Temperature": r["temp_sub"], "Humidity": r["humidity_sub"],
+                    "Air quality": r["aqi_sub"], "Water level": r["water_sub"],
+                    "Wind": r["wind_sub"], "Pressure": r["pressure_sub"]}
+            sub_fig = px.bar(x=list(subs.keys()), y=list(subs.values()),
+                             range_y=[0, 100], title="Risk breakdown by factor (0–100)")
+            sub_fig.update_layout(height=280, margin=dict(t=40, b=10))
+            st.plotly_chart(sub_fig, use_container_width=True)
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Temperature", f"{node_reading['temperature']:.1f}°C")
-            c2.metric("Humidity", f"{node_reading['humidity']:.1f}%")
-            c3.metric("Air Quality", f"{node_reading['air_quality']:.0f} AQI")
-            c4.metric("Water Level", f"{node_reading['water_level']:.2f}m")
-
-            c5, c6, c7, c8 = st.columns(4)
-            ws = node_reading.get('wind_speed')
-            wc = node_reading.get('wind_chill')
-            hi = node_reading.get('heat_index')
-            bp = node_reading.get('barometric_pressure')
-            c5.metric("Wind Speed", f"{ws:.1f} m/s" if ws is not None else "N/A")
-            c6.metric("Wind Chill", f"{wc:.1f}°C" if wc is not None else "N/A")
-            c7.metric("Heat Index", f"{hi:.1f}°C" if hi is not None else "N/A")
-            c8.metric("Barometric Pressure", f"{bp:.1f} hPa" if bp is not None else "N/A")
-
-            if not node_risk.empty:
-                risk_row = node_risk.iloc[0]
-                st.metric("Risk Score", f"{risk_row['score']:.1f}/100 ({risk_row['level']})")
-
-            # Time series charts
-            history = get_node_history(selected_node, minutes=10)
-            if history:
-                hist_df = pd.DataFrame(history)
-                hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
-
-                st.subheader("Sensor History (last 10 min)")
-                for sensor, unit in [("temperature", "°C"), ("humidity", "%"),
-                                     ("air_quality", "AQI"), ("water_level", "m"),
-                                     ("wind_speed", "m/s"), ("wind_chill", "°C"),
-                                     ("heat_index", "°C"), ("barometric_pressure", "hPa")]:
-                    if sensor not in hist_df.columns or hist_df[sensor].isna().all():
-                        continue
-                    fig = px.line(
-                        hist_df, x="timestamp", y=sensor,
-                        title=f"{sensor.replace('_', ' ').title()} ({unit})",
-                    )
-                    fig.update_layout(height=250, margin=dict(t=30, b=20))
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No history yet — data accumulates over time")
-    else:
-        st.info("Waiting for sensor data...")
-
-# === AI INSIGHTS TAB ===
-with tab_ai:
-    st.subheader("AI Anomaly Detection")
-    st.markdown("""
-    The anomaly detection system uses an **Isolation Forest** algorithm trained on
-    2000 synthetic normal sensor readings. It identifies unusual patterns across
-    temperature, humidity, air quality, and water level simultaneously.
-    """)
-
-    if not risks_df.empty:
-        # Show nodes with highest AI multiplier (most anomalous)
-        anomalous = risks_df[risks_df["ai_multiplier"] > 1.0].sort_values("ai_multiplier", ascending=False)
-
-        if not anomalous.empty:
-            st.subheader("Detected Anomalies")
-            for _, row in anomalous.iterrows():
-                boost = (row["ai_multiplier"] - 1.0) * 100
-                node_source = source_map.get(row["node_id"], "simulation")
-                live_tag = " 📡" if node_source == "hardware" else ""
-                st.markdown(
-                    f"**{row['node_id']}**{live_tag} — AI boost: +{boost:.0f}% | "
-                    f"Risk: {row['score']:.1f}/100"
-                )
+        history = get_node_history(node_id, minutes=10)
+        if len(history) > 1:
+            hist = pd.DataFrame(history)
+            hist["timestamp"] = pd.to_datetime(hist["timestamp"])
+            st.subheader("Recent history (last 10 min)")
+            for ch, unit in [("temperature", "°C"), ("water_level", "m"),
+                             ("air_quality", "AQI"), ("barometric_pressure", "hPa")]:
+                line = px.line(hist, x="timestamp", y=ch, title=f"{ch.replace('_', ' ').title()} ({unit})")
+                line.update_layout(height=200, margin=dict(t=30, b=10))
+                st.plotly_chart(line, use_container_width=True)
         else:
-            st.success("No anomalies detected — all readings within normal parameters")
-
-        # Anomaly frequency chart
-        st.subheader("Risk Distribution")
-        fig = px.histogram(
-            risks_df, x="score", nbins=20,
-            color_discrete_sequence=["#FF6B6B"],
-            title="Distribution of Risk Scores Across All Nodes",
-        )
-        fig.update_layout(
-            xaxis_title="Risk Score",
-            yaxis_title="Number of Nodes",
-            height=300,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Sub-score breakdown
-        st.subheader("Risk Sub-Score Breakdown")
-        sub_cols = ["temp_sub", "humidity_sub", "aqi_sub", "water_sub"]
-        sub_labels = ["Temperature", "Humidity", "Air Quality", "Water Level"]
-        avg_subs = [risks_df[c].mean() for c in sub_cols]
-
-        fig = go.Figure(data=[go.Bar(
-            x=sub_labels, y=avg_subs,
-            marker_color=["#FF6B6B", "#4ECDC4", "#95E1D3", "#3498DB"],
-        )])
-        fig.update_layout(
-            title="Average Sub-Scores (0-25 each)",
-            yaxis_range=[0, 25],
-            height=300,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Hardware vs Simulation comparison (if live nodes exist)
-        if live_count > 0 and "source" in readings_df.columns:
-            st.subheader("Hardware vs Simulation Comparison")
-            hw_df = readings_df[readings_df["source"] == "hardware"]
-            sim_df = readings_df[readings_df["source"] == "simulation"]
-
-            for sensor, unit in [("temperature", "°C"), ("humidity", "%"),
-                                 ("air_quality", "AQI"), ("water_level", "m"),
-                                 ("wind_speed", "m/s"), ("wind_chill", "°C"),
-                                 ("heat_index", "°C"), ("barometric_pressure", "hPa")]:
-                col1, col2 = st.columns(2)
-                hw_val = hw_df[sensor].mean() if (not hw_df.empty and sensor in hw_df.columns) else 0
-                sim_val = sim_df[sensor].mean() if (not sim_df.empty and sensor in sim_df.columns) else 0
-                col1.metric(f"Hardware Avg {sensor.replace('_', ' ').title()}", f"{hw_val:.1f} {unit}")
-                col2.metric(f"Simulation Avg {sensor.replace('_', ' ').title()}", f"{sim_val:.1f} {unit}")
+            st.caption("History accumulates as the engine runs.")
     else:
-        st.info("Waiting for risk data...")
+        st.info("Waiting for sensor data…")
 
-# --- Auto-refresh ---
-time.sleep(2)
-st.rerun()
+# === AI EXPLAINABILITY ====================================================
+with tabs[3]:
+    st.subheader("Isolation Forest anomaly detection")
+    st.markdown(
+        "The model learns the *normal* multivariate shape of the data from 2000 "
+        "synthetic samples, then flags readings that are easy to isolate — catching "
+        "unusual **combinations** of values before any single channel crosses a hard "
+        "limit. Each alert says **why** it fired.")
+    if not merged.empty:
+        anomalous = merged[merged["ai_multiplier"] > 1.0].sort_values("anomaly_score", ascending=False)
+        st.subheader("Nodes flagged as anomalous")
+        if not anomalous.empty:
+            for _, row in anomalous.head(12).iterrows():
+                tags = ", ".join(row["top_factors"]) if isinstance(row["top_factors"], list) else ""
+                mesh = " · 🔗 mesh-correlated" if row.get("correlated") else " · isolated"
+                st.markdown(
+                    f"**{row['node_id']}** — anomaly {row['anomaly_score']:.2f} · "
+                    f"AI ×{row['ai_multiplier']:.2f}{mesh}  \n"
+                    f"<span style='color:gray'>Contributors: {tags or 'n/a'}</span>",
+                    unsafe_allow_html=True)
+        else:
+            st.success("No anomalies detected — all readings within learned baseline.")
+
+        st.subheader("Anomaly score distribution")
+        hist = px.histogram(merged, x="anomaly_score", nbins=20,
+                            color_discrete_sequence=["#6c5ce7"])
+        hist.update_layout(height=280, margin=dict(t=10, b=10))
+        st.plotly_chart(hist, use_container_width=True)
+    else:
+        st.info("Waiting for risk data…")
+
+# === EVIDENCE & VALIDATION ================================================
+with tabs[4]:
+    st.subheader("Evidence & validation")
+    st.markdown("Reproducible evidence for judges — every row keeps its data "
+                "source and quality flag, so nothing is overstated.")
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Run mode", str(run_meta.get("mode", "—")).upper())
+    e2.metric("Run scenario", str(run_meta.get("scenario", "—")).upper())
+    e3.metric("Judge mode", "ON" if run_meta.get("judge_mode") else "off")
+    started = run_meta.get("started_at", "—")
+    e4.metric("Run started", started.split("T")[0] if "T" in str(started) else str(started))
+
+    from data.database import count_rows
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Total readings", count_rows("sensor_readings"))
+    t2.metric("Total risk scores", count_rows("risk_scores"))
+    t3.metric("Total alerts", count_rows("alerts"))
+
+    st.markdown("**Export evidence (CSV + JSON):**")
+    st.code("python scripts/export_evidence.py", language="bash")
+    st.caption("Writes readings.csv, risk_scores.csv, alerts.csv, run_summary.json to ./evidence/")
+    st.markdown("**Run a one-command validation:**")
+    st.code("python scripts/run_validation.py --mode demo --scenario flood", language="bash")
+
+# === HARDWARE READINESS ===================================================
+with tabs[5]:
+    st.subheader("Hardware readiness")
+    status = detect()
+    if status["any_physical_sensor_detected"]:
+        st.success("📡 Physical sensor detected — hardware mode available.")
+    else:
+        st.warning("No physical sensor detected — fallback simulation active. "
+                   "The full pipeline still runs.")
+    st.json({
+        "platform": status["platform"],
+        "looks_like_raspberry_pi": status["looks_like_raspberry_pi"],
+        "vernier_weather_library": status["gdx_weather_available"],
+        "adc_air_quality_library": status["adc_air_quality_available"],
+    })
+    st.markdown(
+        "### Planned Vernier adapter pathway\n"
+        "- `sensors/vernier_adapter.py` already implements the hardware path. When a "
+        "Vernier Go Direct Weather sensor is connected over USB, its node emits "
+        "`source=\"hardware\"` readings while the rest of the mesh stays simulated.\n"
+        "- Every adapter returns the **same canonical reading shape**, so no other "
+        "module changes when sensors arrive.\n\n"
+        "### Exact next steps when sensors arrive\n"
+        "1. `pip install godirect` and place the Vernier `gdx/` helper in the project root.\n"
+        "2. Connect the GDX-WTHR over USB and power it on.\n"
+        "3. Run `python run.py --mode hardware` (or `--mode auto`).\n"
+        "4. The `HARROW-SCHOOL` node switches to live hardware data; compare it "
+        "against the simulated/API digital twin for the same location.")
+
+# === COMPETITION PITCH ====================================================
+with tabs[6]:
+    st.subheader("Climate Mesh — competition pitch")
+    st.markdown(
+        "**1. Real-world problem.** Flood-zone maps put Harrow at risk, but the nearest "
+        "official gauge is kilometres away — the areas most at risk aren't being watched. "
+        "Over 90% of weather-related deaths since 1970 occurred where early-warning "
+        "coverage was inadequate.\n\n"
+        "**2. Technical innovation.** A decentralised mesh of 20 London nodes, an "
+        "explainable Isolation Forest anomaly model, mesh correlation (nearby nodes "
+        "confirming a trend escalate risk), and plain-English alerts with action playbooks.\n\n"
+        "**3. Impact.** Plain-language warnings a receptionist or site manager can act on; "
+        "runs offline on a single Raspberry Pi 5 with no cloud subscription.\n\n"
+        "**4. What works now.** The complete pipeline — simulation, optional live "
+        "Open-Meteo API data, risk scoring, alerts, dashboard, and reproducible evidence "
+        "— runs today **without any physical sensors**.\n\n"
+        "**5. What sensor validation adds next.** The architecture is sensor-ready: any "
+        "device that outputs the standard reading format joins the mesh. Physical Vernier "
+        "readings will be compared against the digital twin to validate the model.")
+    st.info("Honest positioning: **sensor-ready, not sensor-dependent.** Until sensors "
+            "are connected, Climate Mesh uses clearly-labelled simulated and/or API data.")
+
+# --- Auto-refresh ---------------------------------------------------------
+if refresh:
+    time.sleep(2)
+    st.rerun()
